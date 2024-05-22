@@ -625,3 +625,336 @@ private:
 		free_device_auxiliary_arrays();
 	}
 };
+
+cuda_error_check( cudaGetLastError() );
+					cuda_error_check( cudaDeviceSynchronize() );
+
+				
+					if (_verbose)
+					{
+						time_get.stop();
+						time_transform.start();
+					}
+		
+					//Apply 2D DCT transform to each layer of 3D group that contains noisy patches
+					run_DCT2D8x8(d_gathered_stacks, d_gathered_stacks, trans_size, num_threads_tr, num_blocks_tr);
+					cuda_error_check( cudaGetLastError() );
+					cuda_error_check( cudaDeviceSynchronize() );
+					
+					//Apply 2D DCT transform to each layer of 3D group that contains patches from basic image estimate
+					run_DCT2D8x8(d_gathered_stacks_basic, d_gathered_stacks_basic, trans_size, num_threads_tr, num_blocks_tr);
+					cuda_error_check( cudaGetLastError() );
+					cuda_error_check( cudaDeviceSynchronize() );
+		
+					
+					if (_verbose)
+					{
+						time_transform.stop();
+						time_wien.start();
+					}
+		
+					/*
+					1) 1D Walsh-Hadamard transform of proper size on the 3rd dimension of each 3D noisy group (from noisy patches) and each 3D basic group (pathes from the basic image estimate)
+					2) Compute wiener coeficients from basic groups
+					3) Filtering: Element-wise multiplication between noisy group and corresponding wiener coefficinets
+					4) Inverse 1D transform to the filtered groups
+					5) Compute the weingt of each 3D group
+					*/
+					run_wiener_filtering(
+						start_point,				//IN: First reference patch of a batch
+						d_gathered_stacks,			//IN/OUT: 3D groups with thransfomed noisy patches that will be filtered
+						d_gathered_stacks_basic,	//IN: 3D groups with thransfomed basic patches estimates
+						d_w_P,						//OUT: Weight of each 3D group
+						d_num_patches_in_stack,		//IN: Numbers of patches in 3D groups
+						stacks_dim,					//IN: Dimensions limiting addresses of reference patches
+						h_wien_params,				//IN: Denoising parameters
+						sigma[channel],				//IN: Noise variance
+						num_threads,				//CUDA: Threads in block
+						num_blocks,					//CUDA: Blocks in grid
+						s_size_t					//CUDA: Shared memory size
+					);
+
+					cuda_error_check( cudaGetLastError() );
+					cuda_error_check( cudaDeviceSynchronize() );
+
+				
+					if (_verbose)
+					{
+						time_wien.stop();
+						time_itransform.start();
+					}
+					
+					//Apply 2D IDCT transform to each layer of 3D group that contains filtered patches
+					run_IDCT2D8x8(d_gathered_stacks, d_gathered_stacks, trans_size, num_threads_tr, num_blocks_tr);
+					
+					cuda_error_check( cudaGetLastError() );
+					cuda_error_check( cudaDeviceSynchronize() );
+					
+				
+					if (_verbose)
+					{
+						time_itransform.stop();
+						time_aggregate.start();
+					}
+
+
+					//Aggregate filtered patches of all 3D groups of a batch into numerator and denominator buffers
+					run_aggregate_block(
+						start_point,			//IN: First reference patch of a batch
+						d_gathered_stacks,		//IN: 3D groups with thransfomed patches
+						d_w_P,					//IN: Numbers of non zero coeficients after 3D thresholding
+						d_stacks,				//IN: Array of adresses of similar patches
+						d_kaiser_window,		//IN: Kaiser window
+						d_numerator[channel],	//IN/OUT: Numerator aggregation buffer
+						d_denominator[channel],	//IN/OUT: Denominator aggregation buffer
+						d_num_patches_in_stack,	//IN: Numbers of patches in 3D groups
+						image_dim,				//IN: Image dimensions
+						stacks_dim,				//IN: Dimensions limiting addresses of reference patches
+						h_wien_params,			//IN: Denoising parameters
+						num_threads,			//CUDA: Threads in block
+						num_blocks				//CUDA: Blocks in grid
+					);			
+					cuda_error_check( cudaGetLastError() );
+					cuda_error_check( cudaDeviceSynchronize() );
+				
+				
+					if (_verbose)
+						time_aggregate.stop();
+				}	
+			}
+		}
+		//Divide numerator by denominator and save resullt to output image
+		for (int channel = 0; channel < channels; ++channel)
+		{
+			run_aggregate_final(
+				d_numerator[channel],			//IN: Aggregation buffer
+				d_denominator[channel],			//IN: Aggregation buffer
+				image_dim,						//IN: Image dimensions
+				denoised_image[channel],		//OUT: Image estimate
+				num_threads_f,
+				num_blocks_f 
+			);
+			cuda_error_check( cudaGetLastError() );
+			cuda_error_check( cudaDeviceSynchronize() );
+		}
+
+		if(_verbose)
+		{
+			//Print timers
+			std::cout << "\rSecond step details:" << std::endl;
+			std::cout << "  BlockMatching took: " << time_blockmatching.getSeconds() << std::endl;
+			std::cout << "  2x Get took: " << time_get.getSeconds() << std::endl;
+			std::cout << "  2x Transform took: " << time_transform.getSeconds() << std::endl;
+			std::cout << "  Wiener filtering took: " << time_wien.getSeconds() << std::endl;
+			std::cout << "  Inverse transform took: " << time_itransform.getSeconds() << std::endl;
+			std::cout << "  Aggregation took: " << time_aggregate.getSeconds() << std::endl;
+		}
+	}
+
+	//Copy image from device to host
+	void copy_host_image(uchar * dst_image, int width, int height, int channels)
+	{
+		size_t image_size = width * height;
+		for (int channel = 0; channel < channels; ++channel)
+		{
+			cuda_error_check( cudaMemcpy(
+						dst_image+channel*image_size,		// Destination
+						d_denoised_image[channel],			// Source
+						image_size*sizeof(uchar),			// Size
+						cudaMemcpyDeviceToHost) );			// Copy direction
+		}
+	}
+
+	//Free all buffers allocated on device that are dependent on 'denoising parameters'.
+	void free_device_auxiliary_arrays()
+	{
+		cuda_error_check( cudaFree(d_stacks) );
+		cuda_error_check( cudaFree(d_num_patches_in_stack) );
+
+		cuda_error_check( cudaFree(d_gathered_stacks));
+		cuda_error_check( cudaFree(d_w_P));
+
+		cuda_error_check( cudaFree(d_kaiser_window));
+
+		if (h_reserved_two_step)
+			cuda_error_check( cudaFree(d_gathered_stacks_basic));
+	}
+
+	//Free all buffers allocated on device that are dependent on image dimensions
+	void free_device_image()
+	{
+		for (auto & it : d_noisy_image)
+			cuda_error_check( cudaFree(it) );
+		d_noisy_image.clear();
+		for (auto & it : d_denoised_image)
+			cuda_error_check( cudaFree(it) );
+		d_denoised_image.clear();
+		for(auto & it : d_numerator) {
+			cuda_error_check( cudaFree(it) );
+		}
+		d_numerator.clear();
+		for(auto & it : d_denominator) {
+			cuda_error_check( cudaFree(it) );
+		}
+		d_denominator.clear();
+	}
+	
+	//Initialize necessary arrays for aggregation by value 0
+	void null_aggregation_buffers(int width, int height)
+	{
+		int size = width * height;
+		for(auto & it : d_numerator) {
+			cuda_error_check( cudaMemset(it, 0, size * sizeof(float)) );
+		}
+		for(auto & it : d_denominator) {
+			cuda_error_check( cudaMemset(it, 0, size * sizeof(float)) );
+		}
+	}
+	
+public:
+	BM3D() : 
+		h_hard_params(),
+		h_wien_params(),
+		d_gathered_stacks(0), d_gathered_stacks_basic(0), d_w_P(0), d_stacks(0), d_num_patches_in_stack(0),
+		h_reserved_width(0), h_reserved_height(0), h_reserved_channels(0), h_reserved_two_step(0), d_kaiser_window(0), _verbose(false)
+	{
+		int device;
+		cuda_error_check( cudaGetDevice(&device) );
+		cuda_error_check( cudaGetDeviceProperties(&properties,device) );
+
+		h_batch_size = make_uint2(256,128);
+	}
+	BM3D(uint n, uint k, uint N, uint T, uint p, float L3D, bool seceon_step) : 
+		h_hard_params(n, k, N, T, p, L3D),
+		h_wien_params(n, k, N, T, p, L3D),
+		d_gathered_stacks(0), d_gathered_stacks_basic(0), d_w_P(0), d_stacks(0), d_num_patches_in_stack(0),
+		h_reserved_width(0), h_reserved_height(0), h_reserved_channels(0), h_reserved_two_step(0), d_kaiser_window(0), _verbose(false)
+	{
+		int device;
+		cuda_error_check( cudaGetDevice(&device) );
+		cuda_error_check( cudaGetDeviceProperties(&properties,device) );
+
+		h_batch_size = make_uint2(256,128);
+		
+		if (k != 8) 
+			throw std::invalid_argument("k has to be 8, other values not implemented yet.");
+	}
+
+	~BM3D()
+	{
+		free_device_image();
+		free_device_auxiliary_arrays();
+	}
+
+
+	/*
+	Source image is denoised unig BM3D algorithm
+	src_image and dst_image are arrays allocated in the host memory and the pixels are stored here by the channels. 
+	First width*height pixels represent luma (Y) component and each following width*height pixels represent color components
+	*/
+	void denoise_host_image(uchar *src_image, uchar *dst_image, int width, int height, int channels, uint* sigma, bool two_step)
+	{
+		Stopwatch total;
+		total.start();
+
+		//Allocation
+		if (h_reserved_width != width || h_reserved_height != height || h_reserved_channels != channels || h_reserved_two_step != two_step)
+			reserve(width, height, channels, two_step);
+
+		if (h_reserved_width == 0 || h_reserved_height == 0 || h_reserved_channels == 0 )
+			return;
+
+		Stopwatch p1;
+		p1.start();
+		
+		//Copying
+		copy_device_image(src_image, width, height, channels);
+
+		//1st denoising step
+		null_aggregation_buffers(width,height);
+		first_step(d_denoised_image, width, height, channels, sigma);
+
+		p1.stop();
+		if (_verbose)
+			std::cout << "1st step took: " << p1.getSeconds() << std::endl;
+		
+		//2nd denoising step
+		if (two_step)
+		{
+			Stopwatch p2;
+			p2.start();
+			null_aggregation_buffers(width,height);
+			second_step(d_denoised_image, width, height, channels, sigma);
+			if (_verbose)
+				std::cout << "2nd step took: " << p2.getSeconds() << std::endl;
+		}
+
+		//Copy back
+		copy_host_image(dst_image, width, height, channels);
+
+		//if(_verbose)
+		std::cout << "Total time: " << total.getSeconds() << std::endl;
+	}
+
+	/*void denoise_device_image(uchar *src_image, uchar *dst_image, int width, int height, int channels, bool two_step)
+	{
+		//TODO
+	}*/
+
+	void set_hard_params(uint n, uint k, uint N, uint T, uint p, float L3D)
+	{
+		if (h_hard_params.k != k || h_hard_params.N != N)
+		{
+			h_hard_params = Params(n,k,N,T,p,L3D);
+			free_device_auxiliary_arrays();
+			allocate_device_auxiliary_arrays();
+		}
+		else
+			h_hard_params = Params(n,k,N,T,p,L3D);
+		
+		if (k != 8) 
+			throw std::invalid_argument("k has to be 8, other values not implemented yet.");
+	}
+	void set_wien_params(uint n, uint k, uint N, uint T, uint p)
+	{
+		if (h_wien_params.k != k || h_wien_params.N != N){
+			h_wien_params = Params(n,k,N,T,p,0.0);
+			free_device_auxiliary_arrays();
+			allocate_device_auxiliary_arrays();
+		}
+		else
+			h_wien_params = Params(n,k,N,T,p,0.0);
+		
+		if (k != 8) 
+			throw std::invalid_argument("k has to be 8, other values not implemented yet.");
+	}
+
+	void set_verbose(bool verbose)
+	{
+		_verbose = verbose;
+	}
+
+	void reserve(int width, int height, int channels, bool two_step)
+	{
+		h_reserved_width = width;
+		h_reserved_height = height;
+		h_reserved_channels = channels;
+		h_reserved_two_step = two_step;
+
+		free_device_image();
+		free_device_auxiliary_arrays(); //TODO: not necessary
+
+		allocate_device_image(width,height,channels);
+		allocate_device_auxiliary_arrays(); //TODO: not necessary
+	}
+	void clear()
+	{
+		h_reserved_width = 0;
+		h_reserved_height = 0;
+		h_reserved_channels = 0;
+		h_reserved_two_step = 0;
+
+		free_device_image();
+		free_device_auxiliary_arrays();
+	}
+};
